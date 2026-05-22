@@ -298,6 +298,7 @@ PERMANENTLY_EXCLUDED = {
     "RLC",      # delisted RLC/BTC on Binance Mar 2026, KuCoin margin ended Jan 2026
     "KNC",      # post-pump exhaustion, no organic protocol demand
     "ORDI",     # high BTC correlation + amplified downside, bearish 70% sentiment
+    "GIGGLE",   # novelty fund token — lost -3.7% with score 18; no real trading setup
 }
 
 # Rug pull / scam detection is now fully automatic via coin_risk_assessor.py
@@ -604,6 +605,276 @@ def _check_wash_trading(coin: dict, ohlcv: list[dict]) -> tuple[bool, str]:
     return False, ""
 
 
+def _load_score_history() -> dict:
+    """Load previous scanner run's per-coin {score, vol_mcap} from data/score_history.json."""
+    path = config.DATA_DIR / "score_history.json"
+    try:
+        if path.exists():
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_score_history(history: dict) -> None:
+    """Persist per-coin score + vol_mcap so next run can compute velocity."""
+    path = config.DATA_DIR / "score_history.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(history, f)
+    except Exception:
+        pass
+
+
+def _get_btc_macd() -> str:
+    """Fetch BTC daily OHLCV via Binance and return its MACD signal (BULLISH/BEARISH/NEUTRAL)."""
+    try:
+        ohlcv = _fetch_ohlcv_binance("BTC", days=30)
+        if ohlcv and len(ohlcv) >= _MIN_CANDLES:
+            ta = compute_ta("bitcoin", "BTC", ohlcv)
+            return ta.macd_signal or "NEUTRAL"
+    except Exception:
+        pass
+    return "NEUTRAL"
+
+
+def _combo_score(
+    rsi: float | None,
+    macd_signal: str | None,
+    change_7d: float,
+    score_velocity: int = 0,
+) -> tuple[int, list[str]]:
+    """
+    Composite opportunity signals (v2.1).
+
+    Bonuses:
+      RSI 45-58 + MACD Bull   → +3
+      7d +3% to +15%          → +2 (healthy momentum)
+      7d -5% to +3%           → +1 (flat base, coiling)
+      MACD Bull + 7d positive → +2 (trend confirmed)
+      Score velocity >= 2pts  → +2 (freshly discovered)
+
+    Penalties:
+      RSI > 62                → -1 (getting extended)
+      7d > +20%               → -2 (already pumped)
+      MACD Bull + 7d < -10%  → -1 (divergence warning)
+    """
+    score = 0
+    reasons: list[str] = []
+
+    # ── Bonuses ──────────────────────────────────────────────────────────
+    if rsi is not None and 45 <= rsi <= 58 and macd_signal == "BULLISH":
+        score += 3
+        reasons.append(f"RSI {rsi:.0f} ideal zone + MACD Bull (+3)")
+
+    if 3 <= change_7d <= 15:
+        score += 2
+        reasons.append(f"7d {change_7d:+.1f}% healthy momentum (+2)")
+    elif -5 <= change_7d < 3:
+        score += 1
+        reasons.append(f"7d {change_7d:+.1f}% flat base coiling (+1)")
+
+    if macd_signal == "BULLISH" and change_7d > 0:
+        score += 2
+        reasons.append(f"MACD Bull + 7d {change_7d:+.1f}% trend confirmed (+2)")
+
+    if score_velocity >= 2:
+        score += 2
+        reasons.append(f"score velocity +{score_velocity}pts — freshly discovered (+2)")
+
+    # ── Penalties ─────────────────────────────────────────────────────────
+    if rsi is not None and rsi > 62:
+        score -= 1
+        reasons.append(f"RSI {rsi:.0f} getting extended (-1)")
+
+    if change_7d > 20:
+        score -= 2
+        reasons.append(f"7d {change_7d:+.1f}% already extended (-2)")
+
+    if macd_signal == "BULLISH" and change_7d < -10:
+        score -= 1
+        reasons.append(f"MACD Bull divergence: 7d {change_7d:+.1f}% (-1)")
+
+    return score, reasons
+
+
+def _check_and_close_positions(current_prices: dict[str, float]) -> list[dict]:
+    """
+    Check OPEN scanner positions against current prices.
+    Closes on TP (+10%), SL (-10%), or age > 24h (EXPIRED).
+    Writes updated rows back to recommendations.csv.
+    Returns list of closed position dicts for immediate display.
+    """
+    import csv as _csv
+    from datetime import datetime, timezone
+
+    csv_path = config.DATA_DIR / "recommendations.csv"
+    if not csv_path.exists():
+        return []
+
+    now = datetime.now(timezone.utc)
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            reader = _csv.DictReader(f)
+            fieldnames = reader.fieldnames or []
+            rows = list(reader)
+    except Exception:
+        return []
+
+    closed: list[dict] = []
+    changed = False
+
+    for row in rows:
+        if row.get("status") != "OPEN":
+            continue
+        if row.get("type", "SCANNER") not in ("SCANNER", ""):
+            continue
+
+        sym = row.get("coin", "").upper()
+        try:
+            entry = float(row.get("entry") or 0)
+        except (ValueError, TypeError):
+            continue
+        if entry <= 0:
+            continue
+
+        current = current_prices.get(sym, 0.0)
+        if current <= 0:
+            continue
+
+        pnl_pct = (current - entry) / entry * 100
+
+        raw_date = row.get("date") or row.get("open_date", "")
+        try:
+            open_dt = datetime.fromisoformat(raw_date.replace(" UTC", "+00:00"))
+            if open_dt.tzinfo is None:
+                open_dt = open_dt.replace(tzinfo=timezone.utc)
+            age_hours = (now - open_dt).total_seconds() / 3600
+        except Exception:
+            age_hours = 0
+
+        close_reason = None
+        new_status = None
+
+        if current >= entry * 1.10:
+            close_reason = f"TP HIT +{pnl_pct:.1f}%"
+            new_status = "WIN"
+        elif current <= entry * 0.90:
+            close_reason = f"SL HIT {pnl_pct:.1f}%"
+            new_status = "LOSS"
+        elif age_hours >= 24:
+            close_reason = f"EXPIRED ({age_hours:.0f}h) PnL {pnl_pct:+.1f}%"
+            new_status = "WIN" if pnl_pct >= 0 else "LOSS"
+
+        if close_reason:
+            row["status"]     = new_status
+            row["pnl_pct"]    = f"{pnl_pct:.2f}"
+            row["close_date"] = now.strftime("%Y-%m-%d %H:%M UTC")
+            closed.append({
+                "symbol":     sym,
+                "reason":     close_reason,
+                "pnl_pct":    pnl_pct,
+                "new_status": new_status,
+                "entry":      entry,
+                "close_price": current,
+            })
+            changed = True
+
+    if changed:
+        try:
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = _csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+        except Exception as e:
+            print(f"  Warning: could not write exit updates to CSV: {e}")
+
+    return closed
+
+
+def _portfolio_summary(current_prices: dict[str, float]) -> None:
+    """Print portfolio state: open positions, closed today, all-time win rate."""
+    import csv as _csv
+    from datetime import datetime, timezone
+
+    csv_path = config.DATA_DIR / "recommendations.csv"
+    if not csv_path.exists():
+        return
+
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            rows = list(_csv.DictReader(f))
+    except Exception:
+        return
+
+    open_pos: list[dict]   = []
+    closed_today: list[dict] = []
+    all_results: list[dict]  = []  # all-time WIN/LOSS for scanner
+
+    for row in rows:
+        if row.get("type", "SCANNER") not in ("SCANNER", ""):
+            continue
+        status = row.get("status", "")
+
+        if status == "OPEN":
+            sym = row.get("coin", "").upper()
+            try:
+                entry = float(row.get("entry") or 0)
+            except Exception:
+                entry = 0.0
+            current = current_prices.get(sym, 0.0)
+            pnl = ((current - entry) / entry * 100) if entry > 0 and current > 0 else None
+            raw_date = row.get("date") or ""
+            try:
+                open_dt = datetime.fromisoformat(raw_date.replace(" UTC", "+00:00"))
+                if open_dt.tzinfo is None:
+                    open_dt = open_dt.replace(tzinfo=timezone.utc)
+                age_h = (now - open_dt).total_seconds() / 3600
+            except Exception:
+                age_h = 0.0
+            open_pos.append({"sym": sym, "entry": entry, "current": current,
+                             "pnl": pnl, "age_h": age_h})
+
+        elif status in ("WIN", "LOSS"):
+            try:
+                pnl = float(row.get("pnl_pct") or 0)
+            except Exception:
+                pnl = 0.0
+            all_results.append({"status": status, "pnl": pnl, "sym": row.get("coin", "")})
+            # Closed today?
+            try:
+                cd = datetime.fromisoformat(
+                    (row.get("close_date") or "").replace(" UTC", "+00:00")
+                )
+                if cd.tzinfo is None:
+                    cd = cd.replace(tzinfo=timezone.utc)
+                if cd >= today_start:
+                    closed_today.append({"sym": row.get("coin",""), "status": status, "pnl": pnl})
+            except Exception:
+                pass
+
+    tp_today  = sum(1 for c in closed_today if c["status"] == "WIN")
+    sl_today  = sum(1 for c in closed_today if c["status"] == "LOSS")
+    total_all = len(all_results)
+    wins_all  = sum(1 for r in all_results if r["status"] == "WIN")
+    win_rate  = (wins_all / total_all * 100) if total_all > 0 else 0
+    avg_pnl   = (sum(r["pnl"] for r in all_results) / total_all) if total_all > 0 else 0
+
+    print(f"\n  PORTFOLIO SUMMARY")
+    print(f"  Open: {len(open_pos)}")
+    for p in open_pos:
+        pnl_str = f"{p['pnl']:+.1f}%" if p["pnl"] is not None else "N/A"
+        cur_str = f"${p['current']:.4f}" if p["current"] > 0 else "N/A"
+        print(f"    {p['sym']:8s} entry ${p['entry']:.4f}  now {cur_str}  PnL {pnl_str}  ({p['age_h']:.0f}h)")
+    print(f"  Closed today: {len(closed_today)} — TP {tp_today} / SL+Expired {sl_today}")
+    print(f"  All-time: {wins_all}W/{total_all - wins_all}L  win rate {win_rate:.0f}%  avg PnL {avg_pnl:+.1f}%")
+
+
 def _quick_score(coin: dict, trending_symbols: set[str] | None = None) -> tuple[int, list[str]]:
     """
     Pre-filter score using bulk market data only (no OHLCV needed).
@@ -633,6 +904,9 @@ def _quick_score(coin: dict, trending_symbols: set[str] | None = None) -> tuple[
     # Hard pre-exclude: circulating supply < 15% (unlock risk)
     if total_s > 0 and circ > 0 and (circ / total_s) < 0.15:
         return -99, ["circ supply <15%"]
+    # Focus on $20M–$300M market cap — large caps move too slowly for 24h 10%+ TP
+    if market_cap > 300_000_000:
+        return -99, ["mcap >$300M — large cap, focus on small/mid caps"]
 
     # ── 7d dip depth (oversold bounce signal) ─────────────────────────────
     if change_7d < -50:
@@ -648,30 +922,31 @@ def _quick_score(coin: dict, trending_symbols: set[str] | None = None) -> tuple[
         score -= 1
         reasons.append(f"7d already up {change_7d:.0f}% (-1)")
 
-    # ── Volume / market-cap ratio (buying pressure) ────────────────────────
-    if vm > 0.50:
-        score += 3
-        reasons.append(f"vol/mcap {vm:.2f}x (+3)")
-    elif vm > 0.30:
-        score += 2
-        reasons.append(f"vol/mcap {vm:.2f}x (+2)")
-    elif vm > 0.10:
-        score += 1
-        reasons.append(f"vol/mcap {vm:.2f}x (+1)")
-    elif vm < 0.02:
+    # ── Volume / market-cap ratio (direction tracked per-run; flag dead/already-pumped) ──
+    if vm < 0.02:
         score -= 1
-        reasons.append(f"vol/mcap {vm:.3f}x dead (+−1)")
+        reasons.append(f"vol/mcap {vm:.3f}x dead (-1)")
+    elif change_24h > 8 and vm > 1.0:
+        # High vol/mcap + already pumped today = activity from sellers exiting, not buyers entering
+        score -= 1
+        reasons.append(f"already pumped {change_24h:+.1f}% with vol/mcap {vm:.2f}x (-1)")
 
-    # ── 24h momentum ──────────────────────────────────────────────────────
-    if 2 <= change_24h <= 15:
-        score += 1
-        reasons.append(f"24h momentum {change_24h:+.1f}% (+1)")
-    elif change_24h > 15:
+    # ── 24h momentum freshness (already-pumped = move likely over) ───────
+    if change_24h > 8:
         score -= 1
-        reasons.append(f"24h already up {change_24h:+.1f}% (-1)")
+        reasons.append(f"24h already pumped {change_24h:+.1f}% (-1)")
+    elif 2 <= change_24h <= 5:
+        score += 1
+        reasons.append(f"24h early momentum {change_24h:+.1f}% (+1)")
     elif change_24h < -5:
         score -= 1
         reasons.append(f"24h bleeding {change_24h:+.1f}% (-1)")
+    # 0-2%: neutral (accumulation phase), 5-8%: mid-stage (no bonus)
+
+    # ── 7d > 24h: steady weekly trend, not a single-day pump ─────────────
+    if change_7d > 0 and change_24h > 0 and change_7d > change_24h:
+        score += 1
+        reasons.append(f"7d ({change_7d:+.1f}%) > 24h ({change_24h:+.1f}%): accelerating trend (+1)")
 
     # ── ATH distance ───────────────────────────────────────────────────────
     # > -60% below ATH: no signal
@@ -702,31 +977,43 @@ def _quick_score(coin: dict, trending_symbols: set[str] | None = None) -> tuple[
     return score, reasons
 
 
-def _ta_score(rsi, macd_signal, bb_position, vol_mcap: float = 0.0) -> tuple[int, list[str]]:
+def _ta_score(
+    rsi,
+    macd_signal,
+    bb_position,
+    vol_mcap: float = 0.0,
+    vol_mcap_history: list | None = None,
+) -> tuple[int, list[str]]:
     """
-    Technical score (v1.0 reset).
+    Technical score (v2.0 — forward-looking 24h entry signals).
 
-    RSI:        <30 = +2 | 30-42 = +1 | 50-65 = +1 | 65-78 = +0 | >78 = gated out
+    RSI:        45-58 = +2 (ideal entry) | 59-65 = +1 | 66-74 = 0 | >74 = -2 | <40 = -1
     MACD:       bullish = +1 | bearish = -1
-    MACD+RSI:   both confirm direction = extra ±1 (prevents false signals in trendless markets)
-    Volume:     >0.50x = +2 | 0.30-0.50x = +1 | <0.30x = +0
+    MACD+RSI:   both confirm direction = extra ±1
+    Vol/MCap:   direction-based: accelerating from low = +3 | accelerating = +2 |
+                high but flat/declining = 0 | dead (<0.02) = -1
     BB:         below lower = +1 | above upper = -2
     """
     score = 0
     reasons = []
 
-    # RSI
+    # RSI — forward-looking 24h entry zones (NOT oversold-bounce logic)
     if rsi is not None:
-        if rsi < 30:
+        if rsi > 74:
+            score -= 2
+            reasons.append(f"RSI {rsi:.1f} overbought — likely to dump (-2)")
+        elif rsi > 65:
+            pass  # caution zone: no bonus, no penalty
+        elif rsi >= 59:
+            score += 1
+            reasons.append(f"RSI {rsi:.1f} momentum zone (+1)")
+        elif rsi >= 45:
             score += 2
-            reasons.append(f"RSI {rsi:.1f} strongly oversold (+2)")
-        elif rsi < 42:
-            score += 1
-            reasons.append(f"RSI {rsi:.1f} oversold (+1)")
-        elif 50 <= rsi <= 65:
-            score += 1
-            reasons.append(f"RSI {rsi:.1f} healthy momentum (+1)")
-        # 65-78: +0, already below overbought gate
+            reasons.append(f"RSI {rsi:.1f} ideal entry zone (+2)")
+        elif rsi < 40:
+            score -= 1
+            reasons.append(f"RSI {rsi:.1f} oversold — risky 24h entry (-1)")
+        # 40-44: neutral
 
     # MACD + RSI combo: confirmed direction earns an extra point
     if macd_signal == "BULLISH":
@@ -742,14 +1029,29 @@ def _ta_score(rsi, macd_signal, bb_position, vol_mcap: float = 0.0) -> tuple[int
             score -= 1
             reasons.append(f"MACD+RSI confirmed bearish (RSI {rsi:.0f}<50) (-1)")
 
-    # Volume / mcap ratio
-    if vol_mcap > 0.50:
-        score += 2
-        reasons.append(f"vol/mcap {vol_mcap:.2f}x strong interest (+2)")
-    elif vol_mcap >= 0.30:
-        score += 1
-        reasons.append(f"vol/mcap {vol_mcap:.2f}x buying pressure (+1)")
-    # 0.15-0.30: +0
+    # Vol/MCap — direction matters, not absolute level
+    # If history available: check if vol/mcap is accelerating vs prior readings
+    _vm_history = vol_mcap_history or []
+    if len(_vm_history) >= 2 and _vm_history[-1] > 0:
+        _prev_vm = _vm_history[-1]
+        _vm_change = (vol_mcap - _prev_vm) / _prev_vm
+        if _vm_change > 0.15:
+            if _prev_vm < 0.10:
+                score += 3
+                reasons.append(f"vol/mcap {vol_mcap:.2f}x rising from low base — early signal (+3)")
+            else:
+                score += 2
+                reasons.append(f"vol/mcap {vol_mcap:.2f}x accelerating (+2)")
+        elif _vm_change < -0.15:
+            pass  # declining — peaked; no bonus even if high
+        # flat (within ±15%): no bonus
+    else:
+        # No history — can't tell direction; only penalize dead volume
+        pass
+
+    if vol_mcap < 0.02:
+        score -= 1
+        reasons.append(f"vol/mcap {vol_mcap:.3f}x — dead volume (-1)")
 
     # Bollinger Bands
     if bb_position == "BELOW_LOWER":
@@ -784,13 +1086,11 @@ def _catalyst_score(
     ath_pct    = coin.get("ath_change_percentage") or 0
     change_24h = coin.get("price_change_percentage_24h") or 0
 
-    # 24h momentum
-    if change_24h > 10:
-        score += 1
-        reasons.append(f"strong 24h momentum {change_24h:+.1f}% (+1)")
-    elif change_24h < 2:
+    # 24h momentum freshness — rewards early-stage moves, penalises already-pumped coins
+    if change_24h > 8:
         score -= 1
-        reasons.append(f"weak 24h {change_24h:+.1f}% (-1)")
+        reasons.append(f"24h already pumped {change_24h:+.1f}% — move likely over (-1)")
+    # 2-8%: handled by _quick_score (early momentum +1); 0-2% = neutral (accumulation)
 
     # Trend (scored separately from MACD)
     if trend == "BULLISH":
@@ -981,14 +1281,18 @@ def _write_shadow_log(symbol: str, score: int, reason_skipped: str) -> None:
 
 
 def _get_previous_closed_trades(symbol: str) -> list[dict]:
-    """Read recommendations.csv and return all WIN/LOSS trades for this symbol."""
+    """Read recommendations.csv AND all archive files for WIN/LOSS trades for this symbol.
+    Includes archives so cooldown/re-entry gates work correctly after CSV archiving."""
     try:
-        csv_path = config.DATA_DIR / "recommendations.csv"
-        if not csv_path.exists():
-            return []
         import csv as _csv
-        with open(csv_path, newline="", encoding="utf-8") as f:
-            rows = list(_csv.DictReader(f))
+        csv_files = [config.DATA_DIR / "recommendations.csv"]
+        csv_files += sorted(config.DATA_DIR.glob("recommendations_archive_*.csv"))
+        rows: list[dict] = []
+        for csv_path in csv_files:
+            if not csv_path.exists():
+                continue
+            with open(csv_path, newline="", encoding="utf-8") as f:
+                rows.extend(list(_csv.DictReader(f)))
         return [
             r for r in rows
             if r.get("coin", "").upper() == symbol.upper()
@@ -1503,6 +1807,28 @@ def run_smart_scanner(
     else:
         print(f"  ✅ ALTCOIN FAVORABLE (BTC.D {_btc_dominance:.1f}%)")
 
+    # BTC MACD macro filter — if BTC daily MACD is bearish, pause ALL new scanner entries.
+    print("  Checking BTC MACD macro signal...")
+    _btc_macd_signal = _get_btc_macd()
+    _btc_macd_bearish = (_btc_macd_signal == "BEARISH")
+    if _btc_macd_bearish:
+        print(f"  🛑 BTC MACD BEARISH — all new scanner entries paused (macro filter)")
+    else:
+        print(f"  BTC MACD: {_btc_macd_signal} — entries enabled")
+
+    # 2b. Build current_prices from bulk market data for exit logic (before filtering)
+    _bulk_prices: dict[str, float] = {
+        c.get("symbol", "").upper(): float(c.get("current_price") or 0)
+        for c in coins
+        if c.get("symbol") and c.get("current_price")
+    }
+    # Run exit logic: close TP/SL/expired positions before scanning for new entries
+    _closed_positions = _check_and_close_positions(_bulk_prices)
+    if _closed_positions:
+        print(f"\n  EXIT EVENTS ({len(_closed_positions)} position(s) closed):")
+        for cp in _closed_positions:
+            print(f"    {cp['symbol']:8s} {cp['reason']} — {cp['new_status']}")
+
     # 3. Filter out stablecoins, wrapped tokens, tokenized stocks, wash traders, and permanently excluded
     excluded = STABLECOINS | WRAPPED_TOKENS | TOKENIZED_STOCKS | WASH_TRADING_CONFIRMED | PERMANENTLY_EXCLUDED
     MIN_MCAP   = 20_000_000   # $20M minimum market cap — allows Kraken small-caps
@@ -1743,7 +2069,11 @@ def run_smart_scanner(
     wash_trading = []  # symbols excluded for wash trading
     _bearish_skip_count = 0       # tracks market-wide bearish alignment skips
     _market_wide_announced = False  # print the relaxed-mode banner only once
-    
+
+    # Load per-coin score history for velocity and vol/mcap direction tracking
+    score_history = _load_score_history()
+    new_score_history: dict = {}
+
     total_candidates = len(candidates)
     print(f"  Debug: Starting TA analysis for {total_candidates} candidates...")
     for i, (coin, qs, qr) in enumerate(candidates):
@@ -1768,11 +2098,28 @@ def run_smart_scanner(
             change_7d = coin.get("price_change_percentage_7d_in_currency") or 0
             ath_pct   = coin.get("ath_change_percentage") or 0
 
-            ts, tr = _ta_score(ta.rsi_14, ta.macd_signal, ta.bollinger_position, vol_mcap=vm)
+            # Load per-coin history for velocity + vol/mcap direction
+            _prev_hist = score_history.get(symbol, {})
+            if isinstance(_prev_hist, (int, float)):  # backward-compat with old int format
+                _prev_hist = {"score": int(_prev_hist)}
+            _prev_vm_hist: list = _prev_hist.get("vol_mcap_history", [])
+
+            ts, tr = _ta_score(ta.rsi_14, ta.macd_signal, ta.bollinger_position, vol_mcap=vm, vol_mcap_history=_prev_vm_hist)
             cs, cr = _catalyst_score(coin, ta.rsi_14, trend=trend_val, change_7d=change_7d)
             ss, sr = _sector_score(symbol, sector_avgs)
 
             coiled_spring = ath_pct < -90 and ta.rsi_14 is not None and ta.rsi_14 < 35
+
+            # Print every candidate — gate exits append a reason to this line
+            _rsi_p  = f"{ta.rsi_14:.0f}" if ta.rsi_14 is not None else " n/a"
+            _macd_p = "Bull" if ta.macd_signal == "BULLISH" else ("Bear" if ta.macd_signal == "BEARISH" else "Neut")
+            _ch24_p = coin.get("price_change_percentage_24h") or 0
+            print(
+                f"  [{i+1:>3}/{total_candidates}] {symbol:8s}"
+                f" | 7d:{change_7d:+6.1f}% 24h:{_ch24_p:+5.1f}%"
+                f" RSI:{_rsi_p:>3} MACD:{_macd_p}",
+                end="", flush=True,
+            )
 
             # Proven winner bonus/penalty based on full W/L record and net P&L
             prev_closed   = _get_previous_closed_trades(symbol)
@@ -1812,8 +2159,7 @@ def run_smart_scanner(
                     _ath_dt = _dt_ath.strptime(_ath_date_str, "%Y-%m-%d")
                     _days_since_ath = (_dt_ath.utcnow() - _ath_dt).days
                     if _days_since_ath <= 45 and ath_pct < -25 and change_7d < -5:
-                        print(f"  ❌ SKIP {symbol}: POST-TGE DUMP — ATH {_days_since_ath}d ago, "
-                              f"{ath_pct:.0f}% from ATH, 7d {change_7d:+.1f}%")
+                        print(f" → POST-TGE dump (ATH {_days_since_ath}d ago, 7d {change_7d:+.1f}%)", flush=True)
                         continue
                 except (ValueError, TypeError):
                     pass
@@ -1832,7 +2178,7 @@ def run_smart_scanner(
                         _hrs_ago = (_now_utc - _close_dt).total_seconds() / 3600
                         if _hrs_ago < 48:
                             _recent_loss = True
-                            print(f"  ❌ SKIP {symbol}: LOSS cooldown — {_hrs_ago:.0f}h ago (48h required)")
+                            print(f" → LOSS cooldown {_hrs_ago:.0f}h ago", flush=True)
                     except Exception:
                         pass
                     break  # only check most recent LOSS
@@ -1852,12 +2198,12 @@ def run_smart_scanner(
                 if _last_tp and _last_tp > 0:
                     _cur_p = coin.get("current_price", 0)
                     if _cur_p > _last_tp:
-                        # print(f"  ❌ SKIP {symbol}: current ${_cur_p:.4f} > prev TP ${_last_tp:.4f} — re-entry too late")
+                        print(f" → above prev TP (price > {_last_tp:.4f})", flush=True)
                         continue
 
             # Gate: extreme pump — coin already ran >200% in 7 days → not a fresh entry
             if change_7d > 200:
-                # print(f"  ❌ SKIP {symbol}: already pumped +{change_7d:.0f}% 7d — whale ride territory, not scanner")
+                print(f" → pumped +{change_7d:.0f}% 7d (whale territory)", flush=True)
                 continue
 
             # Gate: full bearish alignment — skip only if ALL conditions AND not oversold.
@@ -1872,21 +2218,25 @@ def run_smart_scanner(
                     _market_wide_announced = True
                 if change_7d < -15 and change_24h_raw < -8 and not _oversold_exempt:
                     _bearish_skip_count += 1
-                    # print(f"  ❌ SKIP {symbol}: market-wide bearish, hard crash (7d {change_7d:.1f}%, 24h {change_24h_raw:.1f}%)")
+                    print(f" → market-wide crash 7d {change_7d:.1f}% 24h {change_24h_raw:.1f}%", flush=True)
                     continue
             elif (ta.macd_signal == "BEARISH" and trend_val == "BEARISH"
                   and change_7d < -10 and change_24h_raw < -5
                   and not _oversold_exempt):
                 _bearish_skip_count += 1
-                # print(f"  ❌ SKIP {symbol}: full bearish (MACD+Trend BEARISH, 7d {change_7d:.1f}%, 24h {change_24h_raw:.1f}%)")
+                print(f" → full bearish (MACD+Trend, 7d {change_7d:.1f}%)", flush=True)
+                continue
+
+            # Hard fear gate: F&G < 28 → no new entries regardless of individual coin signals.
+            # Data: 1W/8L when F&G ≤ 27 (11% win rate). Individual MACD bullish doesn't save
+            # altcoins when the macro is in fear — BTC drags everything down in a 24h window.
+            if fg_value < 25:
+                print(f" → F&G={fg_value} hard fear block (<25)", flush=True)
                 continue
 
             # Gate: extreme fear (F&G < 30) + no MACD bullish = 49% loss rate (data-driven)
-            # Require MACD bullish confirmation when market is in extreme fear — neutral/bearish
-            # MACD in fear means no momentum confirmation and historically near coin-flip losses.
             if fg_value < 30 and ta.macd_signal != "BULLISH":
-                _write_shadow_log(symbol, 0, f"extreme fear gate (F&G={fg_value}, MACD={ta.macd_signal})")
-                # print(f"  ❌ SKIP {symbol}: F&G {fg_value} (extreme fear) — MACD {ta.macd_signal}, not bullish")
+                print(f" → F&G={fg_value} extreme fear + no MACD bull", flush=True)
                 continue
 
             # Momentum stall flag: MACD bearish + trend neutral → cap score at 2
@@ -1906,34 +2256,87 @@ def run_smart_scanner(
 
             # Gate: circ supply < 15% → hard skip
             if circ_pct_val < 15.0:
-                # print(f"  ❌ SKIP {symbol}: circ supply {circ_pct_val:.0f}% < 15% (unlock risk)")
+                print(f" → circ supply {circ_pct_val:.0f}% (<15% unlock risk)", flush=True)
                 continue
 
             # Gate: POST-PUMP SUPPLY RISK — 24h > +20% AND circ supply < 25%
             # High 24h gain on a low-float token = supply overhang; insiders can dump.
             # Do NOT open position; do NOT send to Groq.
             if change_24h_raw > 20.0 and circ_pct_val < 25.0:
-                # print(f"  ❌ SKIP {symbol}: POST-PUMP SUPPLY RISK — "
-                #       f"24h {change_24h_raw:+.1f}% > +20% with only {circ_pct_val:.0f}% circ supply")
+                print(f" → post-pump supply risk 24h {change_24h_raw:+.1f}% circ {circ_pct_val:.0f}%", flush=True)
                 continue
 
-            # Gate: RSI > 78 → overbought, hard skip
-            if ta.rsi_14 is not None and ta.rsi_14 > 78:
-                # print(f"  ❌ SKIP {symbol}: RSI {ta.rsi_14:.1f} > 78 (overbought)")
+            # ── HARD DISQUALIFIERS (new entries skipped, position monitoring continues) ──
+            # BTC MACD macro filter — pause ALL entries when BTC daily MACD is bearish
+            if _btc_macd_bearish:
+                print(f" → BTC MACD bearish macro block", flush=True)
                 continue
 
+            # RSI > 68 → overbought, skip (previously gated at >80; tightened)
+            if ta.rsi_14 is not None and ta.rsi_14 > 68:
+                print(f" → RSI {ta.rsi_14:.0f} overbought (>68)", flush=True)
+                continue
+
+            # RSI < 38 → oversold in downtrend, skip
+            if ta.rsi_14 is not None and ta.rsi_14 < 38:
+                print(f" → RSI {ta.rsi_14:.0f} oversold (<38)", flush=True)
+                continue
+
+            # 7d < -25% → too much downside momentum, skip
+            if change_7d < -25:
+                print(f" → 7d {change_7d:.1f}% too bearish (<-25%)", flush=True)
+                continue
+
+            # MACD Bear AND 7d negative → double bear confirmation, skip
+            if ta.macd_signal == "BEARISH" and change_7d < 0:
+                print(f" → MACD bear + 7d {change_7d:.1f}% negative", flush=True)
+                continue
+
+            # ── Confluence gate: require 3+ independent bullish signals ───────
+            # Prevents single-indicator flukes — only coins with broad bullish alignment qualify
+            _vm_acc_gate = (
+                len(_prev_vm_hist) >= 2
+                and _prev_vm_hist[-1] > 0
+                and vm > _prev_vm_hist[-1] * 1.10
+            )
+            _gate_bullish = 0
+            if ta.macd_signal == "BULLISH":                                        _gate_bullish += 1
+            if ta.rsi_14 is not None and 45 <= ta.rsi_14 <= 65:                   _gate_bullish += 1
+            if ta.bollinger_position == "BELOW_LOWER":                             _gate_bullish += 1
+            if getattr(ta, "rsi_divergence", None) == "BULLISH":                  _gate_bullish += 1
+            if getattr(ta, "roc_3d", None) is not None and ta.roc_3d > 0:         _gate_bullish += 1
+            if getattr(ta, "williams_r", None) is not None and ta.williams_r > -50: _gate_bullish += 1
+            if _vm_acc_gate:                                                        _gate_bullish += 1
+            if change_7d > 0:                                                       _gate_bullish += 1
+            if _gate_bullish < 3:
+                print(f" → confluence {_gate_bullish}/3 bullish signals", flush=True)
+                continue
+
+            # Gate: ignition filter — coin needs ≥1 signal it will actually move in 24h.
+            # Prevents "dead coins": good TA setup but flat price with no catalyst to push it.
+            # All 5 neutrals (MANTA/BAN/MGO/CGO/ZANO) had 0 ignition signals — none moved.
+            _curr_vol_ig   = float(coin.get("total_volume") or 0)
+            _prev_vol14_ig = float(_prev_hist.get("volume_14d_avg", 0.0))
+            _has_momentum  = change_24h_raw >= 1.5
+            _has_vol_surge = _prev_vol14_ig > 0 and _curr_vol_ig / _prev_vol14_ig >= 2.0
+            _has_rsi_div   = getattr(ta, "rsi_divergence", None) == "BULLISH"
+            _has_bb_buy    = ta.bollinger_position == "BELOW_LOWER"
+            if not (_has_momentum or _has_vol_surge or _has_rsi_div or _has_bb_buy):
+                print(f" → no ignition (24h {change_24h_raw:.1f}%, no vol/RSI/BB signal)", flush=True)
+                continue
 
             circ_cap_reason = []
 
             _pre_score = qs + ts + cs + ss + proven_score + wash_bonus
             ns, nr = 0, []  # news disabled — checked manually via Perplexity
 
-            raw_score = _pre_score + ns - _macro_penalty
+            # _combo_score uses velocity from the PREVIOUS run's value (computed later after
+            # we know raw_score). Use 0 on the first pass; velocity bonus applied below.
+            comb_s, comb_r = _combo_score(ta.rsi_14, ta.macd_signal, change_7d, score_velocity=0)
 
-            _ch7d_log  = coin.get("price_change_percentage_7d_in_currency", 0)
-            _rsi_str   = f"{ta.rsi_14:.0f}" if ta.rsi_14 is not None else "n/a"
-            _macd_str  = "Bull" if ta.macd_signal == "BULLISH" else ("Bear" if ta.macd_signal == "BEARISH" else "Neut")
-            print(f"  Scanning {i+1}/{total_candidates}: {symbol:8s} - score: {raw_score:+2d} | 7d: {_ch7d_log:+6.1f}% | RSI: {_rsi_str:>3} | MACD: {_macd_str}")
+            raw_score = _pre_score + ns + comb_s - _macro_penalty
+
+            print(f" → score:{raw_score:+d}", flush=True)
 
             # Gate: score ≤ 0 → skip entirely
             if raw_score <= 0:
@@ -1948,6 +2351,14 @@ def run_smart_scanner(
                 # print(f"  ⚠️  {symbol} MOMENTUM STALL — score capped 2 (was {raw_score})")
                 raw_score = 2
 
+            # Oversold-in-downtrend cap: RSI < 38 AND 7d < -10% → cap at 3.
+            # A deeply oversold coin still in a weekly downtrend may bounce intraday but
+            # MACD can spike bullish mid-bleed; the cap prevents false conviction.
+            if (ta.rsi_14 is not None and ta.rsi_14 < 38
+                    and change_7d < -10 and raw_score > 3):
+                raw_score = 3
+                circ_cap_reason = circ_cap_reason + [f"oversold downtrend cap: RSI {ta.rsi_14:.0f} + 7d {change_7d:.0f}% (score capped 3)"]
+
             if circ_pct_val < 30.0:
                 supply_risk = "MEDIUM"
                 if raw_score > 3:
@@ -1957,8 +2368,158 @@ def run_smart_scanner(
             else:
                 supply_risk = "NONE"
 
+            # ── Score velocity (requires score_history from previous run) ──────
+            _prev_score_val = _prev_hist.get("score") if isinstance(_prev_hist, dict) else None
+            if isinstance(_prev_score_val, (int, float)):
+                _score_velocity = raw_score - int(_prev_score_val)
+            else:
+                _score_velocity = 0  # no history yet
+            _vel_score = 0
+            _vel_reasons: list[str] = []
+            if _prev_score_val is not None:
+                if _score_velocity >= 4:
+                    _vel_score = 2
+                    _vel_reasons = [f"score velocity +{_score_velocity}pts vs prev run (+2) — freshly discovered"]
+                elif _score_velocity >= 2:
+                    _vel_score = 1
+                    _vel_reasons = [f"score velocity +{_score_velocity}pts vs prev run (+1)"]
+                elif _score_velocity < 0:
+                    _vel_score = -1
+                    _vel_reasons = [f"score velocity {_score_velocity}pts vs prev run (-1) — fading"]
+            raw_score += _vel_score
+
+            # Apply combo velocity bonus now that _score_velocity is known
+            if _score_velocity >= 2 and _prev_score_val is not None:
+                raw_score += 2
+                comb_r = comb_r + [f"combo velocity +{_score_velocity}pts → +2"]
+
+            # ── Risk flag ─────────────────────────────────────────────────────
+            _risk_flag = "CLEAN"
+            if ta.rsi_14 is not None and ta.rsi_14 > 70:
+                # >70 = top of caution zone / entering overbought; flag regardless of the -2 gate at >74
+                _risk_flag = "OVERBOUGHT"
+            elif circ_pct_val < 35 and change_24h_raw > 5:
+                _risk_flag = "UNLOCK_OVERHANG"
+            # SELL_THE_NEWS: airdrop, distribution, claim events dump on release
+            _coin_name_low = coin.get("name", "").lower()
+            if any(kw in _coin_name_low for kw in ("airdrop", "claim", "distribution")):
+                _risk_flag = "SELL_THE_NEWS"
+
+            # ── Entry quality classification ──────────────────────────────────
+            _rsi_eq = ta.rsi_14 if ta.rsi_14 is not None else 55
+            if 45 <= _rsi_eq <= 58 and 1 <= change_24h_raw <= 6:
+                _entry_quality = "EARLY"
+            elif _rsi_eq > 65 or change_24h_raw > 8 or _risk_flag in ("OVERBOUGHT", "UNLOCK_OVERHANG"):
+                # Unlock overhang and overbought coins are late-stage regardless of RSI/momentum
+                _entry_quality = "LATE"
+            else:
+                _entry_quality = "MID"
+
+            # ── Pre-pump setup composite bonus (+4 if all conditions fire) ────
+            # Requires: RSI 48-60 + momentum 1-6% + velocity 3+ + vol/mcap rising
+            _vm_accelerating = (
+                len(_prev_vm_hist) >= 2
+                and _prev_vm_hist[-1] > 0
+                and vm > _prev_vm_hist[-1] * 1.10
+            )
+            _pre_pump = (
+                ta.rsi_14 is not None and 48 <= ta.rsi_14 <= 60
+                and 1 <= change_24h_raw <= 6
+                and _score_velocity >= 3
+                and _vm_accelerating
+            )
+            if _pre_pump:
+                raw_score += 4
+                _entry_quality = "EARLY"  # force top of list
+
+            # ── Research v2 signals: Volume spike, BB squeeze, Williams %R, ROC-3d, RSI div ──
+
+            # 1. Volume vs 14-day rolling average (spike = institutional buying)
+            _prev_vol14d = float(_prev_hist.get("volume_14d_avg", 0.0))
+            _curr_vol = float(coin.get("total_volume") or 0)
+            _new_vol14d = (_prev_vol14d * 13 + _curr_vol) / 14 if _prev_vol14d > 0 else _curr_vol
+            _vol_spike_score = 0
+            _vol_spike_reasons: list[str] = []
+            if _prev_vol14d > 0:
+                _vol_ratio = _curr_vol / _prev_vol14d
+                if _vol_ratio >= 3.0:
+                    _vol_spike_score = 3
+                    _vol_spike_reasons = [f"vol spike {_vol_ratio:.1f}x 14d avg — institutional buying (+3)"]
+                elif _vol_ratio >= 1.5:
+                    _vol_spike_score = 1
+                    _vol_spike_reasons = [f"vol {_vol_ratio:.1f}x above 14d avg — accumulation (+1)"]
+            raw_score += _vol_spike_score
+
+            # 2. Bollinger Band squeeze (width contraction = imminent breakout)
+            _bb_sq_score = 0
+            _bb_sq_reasons: list[str] = []
+            if getattr(ta, "bb_width_pct", None) is not None and ta.bb_width_pct < 0.6:
+                _bb_sq_score = 2
+                _bb_sq_reasons = [f"BB SQUEEZE {ta.bb_width_pct:.2f}x avg — breakout imminent (+2)"]
+            raw_score += _bb_sq_score
+
+            # 3. Williams %R + RSI confluence (strongest single-candle confluence signal)
+            _wr_score = 0
+            _wr_reasons: list[str] = []
+            _wr_val = getattr(ta, "williams_r", None)
+            if _wr_val is not None and ta.rsi_14 is not None:
+                if -50 < _wr_val <= -20 and 45 <= ta.rsi_14 <= 58:
+                    _wr_score = 3
+                    _wr_reasons = [f"Williams %R {_wr_val:.0f} + RSI {ta.rsi_14:.0f} confluence (+3)"]
+                elif _wr_val > -20:
+                    _wr_score = -1
+                    _wr_reasons = [f"Williams %R {_wr_val:.0f} overbought zone (-1)"]
+            raw_score += _wr_score
+
+            # 4. ROC-3d (momentum acceleration)
+            _roc_score = 0
+            _roc_reasons: list[str] = []
+            _roc_val = getattr(ta, "roc_3d", None)
+            if _roc_val is not None:
+                if _roc_val > 5:
+                    _roc_score = 2
+                    _roc_reasons = [f"ROC-3d +{_roc_val:.1f}% accelerating momentum (+2)"]
+                elif _roc_val > 0:
+                    _roc_score = 1
+                    _roc_reasons = [f"ROC-3d +{_roc_val:.1f}% positive momentum (+1)"]
+                elif _roc_val < -5:
+                    _roc_score = -1
+                    _roc_reasons = [f"ROC-3d {_roc_val:.1f}% declining momentum (-1)"]
+            raw_score += _roc_score
+
+            # 5. RSI divergence — bullish divergence is a leading reversal indicator
+            _div_score = 0
+            _div_reasons: list[str] = []
+            _rsi_div_val = getattr(ta, "rsi_divergence", None)
+            if _rsi_div_val == "BULLISH":
+                _div_score = 3
+                _div_reasons = ["BULLISH RSI divergence: price lower low + RSI higher low (+3)"]
+            elif _rsi_div_val == "BEARISH":
+                _div_score = -2
+                _div_reasons = ["BEARISH RSI divergence: price higher high + RSI lower high (-2)"]
+            raw_score += _div_score
+
+            # ── Save to score history for next run ────────────────────────────
+            _new_vm_hist = list(_prev_vm_hist)
+            _new_vm_hist.append(vm)
+            if len(_new_vm_hist) > 3:
+                _new_vm_hist = _new_vm_hist[-3:]
+            new_score_history[symbol] = {
+                "score": raw_score,
+                "vol_mcap": vm,
+                "vol_mcap_history": _new_vm_hist,
+                "volume_14d_avg": _new_vol14d,
+            }
+
             risk_warning  = coin.get("_risk_warning", "")
-            extra_reasons = qr + tr + cr + nr + sr + proven_reason + _stall_reason + circ_cap_reason + ([f"Manipulation Intent (Wash Trading) (+2)"] if is_wash else [])
+            extra_reasons = (
+                qr + tr + cr + comb_r + nr + sr + proven_reason + _stall_reason
+                + circ_cap_reason + _vel_reasons
+                + _vol_spike_reasons + _bb_sq_reasons + _wr_reasons
+                + _roc_reasons + _div_reasons
+                + ([f"PRE-PUMP SETUP: RSI+momentum+velocity+vol aligned (+4)"] if _pre_pump else [])
+                + ([f"Manipulation Intent (Wash Trading) (+2)"] if is_wash else [])
+            )
             if risk_warning and supply_risk == "NONE":
                 # Only prepend risk_warning for coins not already flagged by supply tier
                 extra_reasons = [f"⚠️ {risk_warning[:80]}"] + extra_reasons
@@ -2062,6 +2623,12 @@ def run_smart_scanner(
                 "security_status":  risk_info.category if risk_info else "NORMAL",
                 "liquidity_usd":    0.0,  # updated later
                 "news_score":       ns,   # raw news points: >0 bullish, <0 bearish, 0 none/neutral
+                # v2.0 forward-looking fields
+                "entry_quality":    _entry_quality,   # EARLY / MID / LATE
+                "risk_flag":        _risk_flag,        # OVERBOUGHT / SELL_THE_NEWS / UNLOCK_OVERHANG / CLEAN
+                "score_velocity":   _score_velocity,  # delta vs previous run
+                "catalyst_status":  "NONE",            # IMMINENT/FRESH/PRICED_IN/NONE (news disabled)
+                "pre_pump_setup":   _pre_pump,         # True if all 4 composite conditions fire
             })
             rsi_str  = f"RSI={ta.rsi_14:.0f}" if ta.rsi_14 else "RSI=n/a"
             bb_str   = f"BB={ta.bollinger_position}" if ta.bollinger_position else "BB=n/a"
@@ -2070,6 +2637,26 @@ def run_smart_scanner(
             print(f"  Scanning {i+1}/{total_candidates}: {symbol:8s} - ERROR: {_e}")
 
         time.sleep(0.11 if _cp_ok else 2)  # CP: 10 req/sec; CG: ~30 req/min
+
+    # Persist score + vol/mcap history for next run (enables velocity + direction tracking)
+    _save_score_history(new_score_history)
+
+    # Deduplicate: same symbol from different data sources → keep highest score only
+    _seen: dict[str, int] = {}   # clean_symbol → index in _deduped
+    _deduped: list[dict] = []
+    for r in results:
+        _clean_sym = r["symbol"].upper().replace(" [MANIPULATION PLAY]", "")
+        if _clean_sym in _seen:
+            _idx = _seen[_clean_sym]
+            if r["score"] > _deduped[_idx]["score"]:
+                _deduped[_idx] = r
+        else:
+            _seen[_clean_sym] = len(_deduped)
+            _deduped.append(r)
+    _removed_dupes = len(results) - len(_deduped)
+    if _removed_dupes:
+        print(f"  Deduplication: {_removed_dupes} duplicate symbol(s) removed (kept highest score)")
+    results = _deduped
 
     if wash_trading:
         print(f"  ⚠️  {len(wash_trading)} wash trading coin(s) excluded from ranking")
@@ -2083,21 +2670,22 @@ def run_smart_scanner(
         if removed:
             print(f"  🚫 {removed} coin(s) hidden — on EXCLUDED cooldown: {', '.join(excluded_cooldown)}")
 
-    # Sort: primary = score, then tiebreakers in order.
-    # clean_setup_tb is checked BEFORE 24h momentum: a coin with supply flag or
-    # above upper BB ranks below a clean coin at the same score, regardless of how
-    # much it pumped today.
+    # Sort: entry_quality FIRST (EARLY > MID > LATE), then score, then tiebreakers.
+    # Pre-pump setups are forced EARLY so they always surface at the top.
+    _eq_rank = {"EARLY": 2, "MID": 1, "LATE": 0}
     results.sort(
         key=lambda x: (
-            x["score"],
-            x.get("deep_dip_tb", 0),         # TB-0: DEEP DIP (SIREN bonus) prioritized first
-            x.get("clean_setup_tb", 0),      # TB-1: clean (no flag, no above-BB) beats flagged
-            x.get("change_24h", 0),          # TB-2: highest 24h momentum wins
-            x.get("vol_mcap", 0),            # TB-3: higher vol/mcap = more active trading
-            x.get("proven_wins_tb", 0),      # TB-4: proven winner is more reliable
-            1 if x.get("sec_commodity") else 0,  # TB-5: SEC/CFTC commodity = quality filter
-            x.get("supply_capped_tb", 0),    # TB-6: supply-restricted coins rank lower
-            x.get("momentum_stall_tb", 0),   # TB-7: stalled coins rank last among ties
+            _eq_rank.get(x.get("entry_quality", "MID"), 1),  # PRIMARY: entry quality
+            x["score"],                                        # SECONDARY: total score
+            1 if x.get("pre_pump_setup") else 0,             # TB-0: pre-pump composite bonus
+            x.get("deep_dip_tb", 0),                         # TB-1: deep dip (SIREN bonus)
+            x.get("clean_setup_tb", 0),                      # TB-2: clean setup
+            x.get("change_24h", 0),                          # TB-3: 24h momentum
+            x.get("vol_mcap", 0),                            # TB-4: vol/mcap activity
+            x.get("proven_wins_tb", 0),                      # TB-5: proven winner
+            1 if x.get("sec_commodity") else 0,              # TB-6: commodity quality
+            x.get("supply_capped_tb", 0),                    # TB-7: supply risk
+            x.get("momentum_stall_tb", 0),                   # TB-8: stalled coins last
         ),
         reverse=True,
     )
@@ -2140,18 +2728,19 @@ def run_smart_scanner(
 
             r["liquidity_usd"] = liq
 
-            # Hard exclusion gate: skip coins with less than $50k liquidity
-            if liq > 0 and liq < 50_000:
-                print(f"  🚫 SKIP {r['symbol']}: Liquidity too low (${liq/1e3:.0f}k)")
+            # Liquidity as safety filter (not score booster for already-hot coins)
+            # < $500k → disqualify (too easy for whales to exit without slippage)
+            if 0 < liq < 500_000:
+                print(f"  🚫 SKIP {r['symbol']}: Liquidity too low (${liq/1e3:.0f}k < $500k threshold)")
                 continue
 
-            if liq >= 50_000:
-                if liq < 100_000:
-                    r["score"] -= 2
-                    r["reasons"].append(f"Low liquidity (${liq/1e3:.0f}k)")
-                elif liq > 1_000_000:
+            if liq >= 500_000:
+                if 5_000_000 <= liq <= 100_000_000:
+                    # Sweet spot: liquid enough to enter, small enough to move
                     r["score"] += 1
-                    r["reasons"].append(f"Deep liquidity (${liq/1e6:.1f}M)")
+                    r["reasons"].append(f"Liquidity sweet spot (${liq/1e6:.1f}M) (+1)")
+                # $500k-$5M: eligible, no bonus
+                # >$100M: institutional depth — slower moves, no bonus
             filtered_results.append(r)
         except Exception:
             filtered_results.append(r)  # keep if liquidity check fails
@@ -2162,24 +2751,67 @@ def run_smart_scanner(
     # ── FINAL RANKING DISPLAY ──
     sorted_results = sorted(final_results, key=lambda x: x.get("score", 0), reverse=True)
 
-    # Tier spots: top coins that clear the minimum threshold, capped at 24
-    top_spots = [r for r in sorted_results if r.get("score", 0) >= 3][:24]
+    # Tier spots: top 5 highest-conviction coins (score ≥ 16)
+    # Threshold raised from 7 → 16 based on data: score ≤ 15 = 0% win rate (0W/12L/3N);
+    # score 16-17 = 75% win rate (3W/1L). Nothing below 16 has ever won.
+    top_spots = [r for r in sorted_results if r.get("score", 0) >= 16][:5]
     top10     = sorted_results[:10]   # kept for backward-compat return value
 
-    # Fetch 1-sentence news catalysts for the top tier picks
+    # News check for top 5 picks: build catalyst display + filter out bearish-news coins
     _catalysts: dict[str, str] = {}
-    try:
-        from src.connectors.web_research import get_top10_catalysts as _get_catalysts
-        _catalysts = _get_catalysts(top_spots)
-    except Exception:
-        pass
+    if top_spots:
+        try:
+            from src.connectors.web_research import fetch_news_for_coins as _fetch_news
+            print(f"  Checking news for {len(top_spots)} top picks...")
+            _news_raw = _fetch_news(top_spots, limit_per_coin=10)
+
+            # Build catalyst display strings from fetched news (no second API call)
+            for _r in top_spots:
+                _sym = _r["symbol"].upper()
+                _fresh = [
+                    n for n in _news_raw.get(_sym, [])
+                    if n.get("age_hours") is not None and n.get("age_hours") <= 168
+                ]
+                _catalysts[_sym] = _fresh[0]["title"][:120] if _fresh else ""
+
+            # Filter: disqualify coins with bearish news before logging / displaying
+            _news_filtered = []
+            for _r in top_spots:
+                _sym   = _r["symbol"].upper()
+                _items = _news_raw.get(_sym, [])
+                _items_scored = [
+                    {
+                        "title":    it["title"],
+                        "age_days": (it.get("age_hours") or 0) / 24,
+                        "source":   it.get("source", ""),
+                    }
+                    for it in _items
+                ]
+                _n_score, _n_reasons = _news_score(
+                    _items_scored, symbol=_sym, coin_name=_r.get("name", "")
+                )
+                _r["news_score"] = _n_score
+                if _n_score < 0:
+                    print(
+                        f"  ❌ {_sym} REMOVED from top picks: bearish news — "
+                        f"{'; '.join(_n_reasons)}"
+                    )
+                    continue
+                if _n_score > 0:
+                    _r["reasons"] = list(_r.get("reasons", [])) + [
+                        f"news catalyst confirmed (+{_n_score})"
+                    ]
+                _news_filtered.append(_r)
+            top_spots = _news_filtered
+        except Exception as _ne:
+            print(f"  ⚠️  News check failed: {_ne}")
 
     if top_spots:
-        print(f"\n  💰  TIER SPOTS — {len(top_spots)}/24 coins with score ≥ 3\n" + "=" * 60)
+        print(f"\n  💰  TIER SPOTS — {len(top_spots)}/5 coins with score ≥ 16\n" + "=" * 60)
         for rank, r in enumerate(top_spots, 1):
             _print_pick(rank, r, _catalysts)
     else:
-        print(f"\n  💰  TIER SPOTS: none found (all coins scored < 3)")
+        print(f"\n  💰  TIER SPOTS: none found (score < 16 after confluence gate + all filters)")
 
     # ── HOLD positions display (always show) ──
     if open_positions:
@@ -2330,6 +2962,12 @@ def run_smart_scanner(
         if wr["hc_score"] >= 3 or wr.get("cycle_number", 0) >= 2:
             valuable_wr.append(wr)
 
+    # ── Portfolio Summary ── (printed every scan cycle)
+    try:
+        _portfolio_summary(_bulk_prices)
+    except Exception as _ps_e:
+        print(f"  Portfolio summary error: {_ps_e}")
+
     # ── Final Return ──
     quality_count = len(top_spots)
     categories    = {"spots": top_spots}
@@ -2350,18 +2988,28 @@ def _print_pick(rank: int, r: dict, catalysts: dict, label: str = "") -> None:
     liq_str  = f"${liq_usd/1e3:.0f}k" if liq_usd < 1e6 else f"${liq_usd/1e6:.1f}M"
     liq_icon = "💧" if liq_usd >= 100_000 else "⚠️"
 
-    print(f"\n  {rank}. {r['symbol']} ({r['name']})  —  {label}score: {r.get('score', 0)} pts{supply_tag}{hold_tag}")
+    eq        = r.get("entry_quality", "MID")
+    rf        = r.get("risk_flag", "CLEAN")
+    sv        = r.get("score_velocity", 0)
+    eq_icon   = "🟢" if eq == "EARLY" else ("🟡" if eq == "MID" else "🔴")
+    rf_icon   = "⚠️ " if rf != "CLEAN" else "✅"
+    pp_tag    = "  [🎯 PRE-PUMP SETUP]" if r.get("pre_pump_setup") else ""
+    sv_str    = f"{sv:+d}pts" if sv != 0 else "—"
+
+    print(f"\n  {rank}. {r['symbol']} ({r['name']})  —  {label}score: {r.get('score', 0)} pts{supply_tag}{hold_tag}{pp_tag}")
     print(f"     Price: ${r.get('price', 0):.4f}  |  24h: {r.get('change_24h', 0):+.1f}%  |  7d: {r.get('change_7d', 0):+.1f}%")
+    print(f"     {eq_icon} Entry: {eq}  |  {rf_icon} Risk: {rf}  |  Velocity: {sv_str}")
     print(f"     {sec_icon} SECURITY: {sec_text}  |  {liq_icon} LIQUIDITY: {liq_str}")
     if 'rsi' in r:
         print(f"     RSI {r['rsi']:.1f}  |  MACD: {r['macd']}  |  Trend: {r['trend']}")
     print(f"     Signals: {', '.join(r['reasons']) if r.get('reasons') else 'none'}")
     
-    cat_summary = catalysts.get(r["symbol"].upper(), "No recent news found")
-    if isinstance(cat_summary, dict):
-        print(f"     📰 Summary: {cat_summary.get('summary', 'No summary')}")
-    else:
-        print(f"     📰 News:  {cat_summary}")
+    cat_summary = catalysts.get(r["symbol"].upper(), "")
+    n_score = r.get("news_score", 0)
+    n_icon  = "🟢" if n_score > 0 else ("🔴" if n_score < 0 else "🟡")
+    n_label = "CATALYST" if n_score > 0 else ("BEARISH" if n_score < 0 else "NEUTRAL")
+    headline = (cat_summary.get("summary", "") if isinstance(cat_summary, dict) else cat_summary) or "No recent news"
+    print(f"     {n_icon} News ({n_label}): {headline}")
 
 
 def _send_telegram_valuable(
@@ -2385,7 +3033,12 @@ def _send_telegram_valuable(
     if spots:
         msg += f"\n💰 <b>SPOTS ({len(spots)} coins):</b>\n"
         for i, r in enumerate(spots, 1):
-            msg += f"  {i}. <b>{r['symbol']}</b> @ {_f(r['price'])} (Score {r['score']})\n"
+            eq   = r.get("entry_quality", "MID")
+            rf   = r.get("risk_flag", "CLEAN")
+            eq_e = "🟢" if eq == "EARLY" else ("🟡" if eq == "MID" else "🔴")
+            rf_e = f" ⚠️{rf}" if rf != "CLEAN" else ""
+            pp_e = " 🎯" if r.get("pre_pump_setup") else ""
+            msg += f"  {i}. <b>{r['symbol']}</b> @ {_f(r['price'])} (Score {r['score']}) {eq_e}{eq}{rf_e}{pp_e}\n"
 
     # Add best Whale Rides
     val_wr = [wr for wr in whale_rides if wr.get("cycle_number", 0) >= 2][:3]

@@ -34,7 +34,7 @@ VOL_HISTORY_PATH = config.DATA_DIR / "whale_volume_history.json"
 
 # ── Volume anomaly thresholds ─────────────────────────────────────────────────
 _VOL_PRE_MULT     = 5.0    # today vol > 5x 30d avg → PRE-PUMP (early accumulation)
-_VOL_EARLY_MULT   = 2.0    # today vol > 2x 30d avg → EARLY signal (fear market = lower baseline)
+_VOL_EARLY_MULT   = 4.0    # today vol > 4x 30d avg → EARLY signal (2x was normal noise)
 _VOL_MID_MULT     = 8.0    # today vol > 8x 30d avg → MID (confirmed pump)
 _PRICE_PRE_MIN    = 2.0    # 24h minimum for PRE stage
 _PRICE_PRE_MAX    = 7.0    # PRE cap — above this qualifies for EARLY instead
@@ -65,14 +65,22 @@ _PRE_MIN_HISTORY  = 14          # need 14 days vol history — no cold-start est
 _PRE_MIN_MCAP     = 50_000_000  # $50M minimum (2.5x stricter than regular)
 _PRE_COOLDOWN_HOURS = 4         # re-alert PRE stage every 4h (not 24h)
 
+# Early accumulation (ACCUMULATION stage) thresholds
+_ACC_VOL_MULT   = 3.0    # vol vs 30d avg minimum for ACCUMULATION stage
+_ACC_VM_MIN     = 0.15   # 15% vol/mcap = institutional-scale buying signal
+_ACC_PRICE_MAX  = 2.0    # max 24h move for ACCUMULATION (PRE stage begins at 2%)
+_OBI_BULLISH    = 0.62   # order book imbalance: ≥62% bids = strong buy side
+
 # ── Exit / post-crash thresholds ──────────────────────────────────────────────
 _MAX_HOLD_HOURS   = 24.0   # whale rides are short-term — exit after 24h
-_EXIT_24H_FLOOR   = 5.0    # 24h below this → momentum dying → exit signal
+_EXIT_ENTRY_STOP  = 4.0    # drop >4% from entry price → stop out (replaces ch24 floor)
 _EXIT_RSI_CEIL    = 85.0   # RSI above this → overbought → exit signal
 
 _CRASH_DROP_PCT   = 30.0   # post-crash bounce: must have dropped ≥30% from peak
 _CRASH_RSI_MAX    = 30.0   # RSI must be oversold (<30) for bounce entry
 _CRASH_VOL_MAX    = 0.30   # volume must be dying (low vol = stable bottom)
+
+_EXIT_TP_PCT      = 10.0   # take profit at +10% from alert price
 
 # ── Noise-Beater Thresholds ──────────────────────────────────────────────────
 _NB_MIN_VOL_24H   = 20_000_000  # $20M min volume for Noise-Beater signals
@@ -216,6 +224,61 @@ def _fmt_mcap(m: float) -> str:
     return f"${m/1e6:.0f}M"
 
 
+# ── P25 Probability Estimator ────────────────────────────────────────────────
+
+def _estimate_p25_probability(c: dict) -> float:
+    """
+    Estimate probability (0.0–1.0) that this candidate can reach +25% from entry.
+
+    Components (four independent buckets, additive):
+      Volume conviction   max 35% — strongest predictor; vol_ratio × vol_mcap
+      Momentum stage      max 25% — EARLY 5-15% 24h is the sweet spot
+      Technical health    max 25% — RSI zone, ATH headroom, order-book imbalance
+      Pattern quality     max 15% — BB squeeze, short squeeze, 7d uptrend
+    """
+    prob      = 0.0
+    vol_ratio = c.get("vol_ratio", 0)
+    vol_mcap  = c.get("vol_mcap",  0)
+    ch24      = c.get("change_24h", 0)
+    rsi       = c.get("rsi_14", 50)
+    ath_pct   = c.get("ath_change", -50)
+    obi       = c.get("obi", 0.0)
+    ch7d      = c.get("change_7d", 0)
+    stage     = c.get("stage", "EARLY")
+
+    # 1. Volume conviction (max 35%)
+    if   vol_ratio >= 10 and vol_mcap >= 0.25: prob += 0.35
+    elif vol_ratio >= 7  and vol_mcap >= 0.20: prob += 0.28
+    elif vol_ratio >= 5  and vol_mcap >= 0.15: prob += 0.22
+    elif vol_ratio >= 3  and vol_mcap >= 0.10: prob += 0.15
+    else:                                       prob += 0.05
+
+    # 2. Momentum stage (max 25%)
+    if   stage == "EARLY" and  5 <= ch24 <= 15:         prob += 0.25
+    elif stage == "EARLY" and  2 <= ch24 <  5:           prob += 0.18
+    elif stage in ("EARLY", "MID") and 15 < ch24 <= 25:  prob += 0.15
+    elif stage == "MID"   and  5 <= ch24 <= 30:          prob += 0.20
+
+    # 3. Technical health (max 25%)
+    if   45 <= rsi <= 65:                      prob += 0.10
+    elif 35 <= rsi < 45 or 65 < rsi <= 72:     prob += 0.05
+    if   ath_pct < -60:                        prob += 0.08
+    elif ath_pct < -30:                        prob += 0.04
+    if   obi >= 0.65:                          prob += 0.07
+    elif obi >= 0.55:                          prob += 0.03
+
+    # 4. Pattern quality (max 15%)
+    if c.get("bb_squeeze"):                    prob += 0.05
+    if c.get("funding_rate", 0.0) < -0.02:    prob += 0.05
+    if 5 <= ch7d <= 50:                        prob += 0.05
+
+    # 5. Late-stage penalty — coin already deep in a pump cycle
+    if   ch7d > 100: prob -= 0.20   # extreme overextension, reversal likely
+    elif ch7d >  60: prob -= 0.12   # already pumped hard, most of the move is done
+
+    return max(min(prob, 1.0), 0.0)
+
+
 # ── Detection ─────────────────────────────────────────────────────────────────
 
 def detect_whale_rides(
@@ -323,6 +386,15 @@ def detect_whale_rides(
             and len(hist.get(sym, [])) >= _PRE_MIN_HISTORY
         ):
             stage = "PRE"
+        elif (
+            not _cold_start
+            and vol_ratio >= _ACC_VOL_MULT
+            and (vol / max(mcap, 1)) >= _ACC_VM_MIN
+            and 0.5 <= ch24 < _ACC_PRICE_MAX
+            and mcap >= _PRE_MIN_MCAP
+            and len(hist.get(sym, [])) >= _PRE_MIN_HISTORY
+        ):
+            stage = "ACCUMULATION"
         else:
             continue
 
@@ -332,7 +404,7 @@ def detect_whale_rides(
             prev_ts = prev_24h_entry.get("ts", 0)
             age_h   = (now_ts - prev_ts) / 3600
             if age_h < 6:
-                if stage == "PRE":
+                if stage in ("PRE", "ACCUMULATION"):
                     prev_ch24 = prev_24h_entry.get("ch24", ch24)
                     if ch24 <= prev_ch24:
                         continue
@@ -340,7 +412,7 @@ def detect_whale_rides(
                     continue
                 elif stage == "MID" and ch24 < _PRICE_EARLY_MAX:
                     continue
-        elif stage == "PRE":
+        elif stage in ("PRE", "ACCUMULATION"):
             continue
 
         # ── Noise-Beater Technical Check ──
@@ -364,14 +436,41 @@ def detect_whale_rides(
         
         # Disqualify if too choppy or overbought
         is_choppy = atr_pct > _NB_ATR_MAX_PCT
-        is_exhausted = rsi_14 > _NB_RSI_MAX or rsi_14 < _NB_RSI_MIN
+        is_exhausted = rsi_14 > _NB_RSI_MAX or (rsi_14 < _NB_RSI_MIN and stage != "ACCUMULATION")
         is_below_trend = curr_p < ema_20_h if ema_20_h > 0 else False
         
         if is_choppy or is_exhausted or is_below_trend:
             continue
 
+        # OBI — order book imbalance: bids / (bids + asks) from Binance depth
+        _obi = 0.0
+        try:
+            from src.connectors.binance import fetch_binance_orderbook
+            ob = fetch_binance_orderbook(sym, limit=20)
+            if ob:
+                bids_vol = sum(b[1] for b in ob.get("bids", []))
+                asks_vol = sum(a[1] for a in ob.get("asks", []))
+                _tot = bids_vol + asks_vol
+                if _tot > 0:
+                    _obi = round(bids_vol / _tot, 3)
+        except Exception:
+            pass
+
+        # Funding rate — deeply negative = shorts being squeezed
+        _funding_rate = 0.0
+        try:
+            from src.connectors.binance import fetch_binance_futures_data
+            fut_data = fetch_binance_futures_data(sym)
+            if fut_data:
+                _funding_rate = round(fut_data.get("funding_rate", 0.0), 5)
+        except Exception:
+            pass
+
+        # BB squeeze from daily TA: current width / 20-period avg width < 0.6
+        _bb_squeeze = ta_d.bb_width_pct is not None and ta_d.bb_width_pct < 0.60
+
         vm = vol / max(mcap, 1)
-        candidates.append({
+        _entry = {
             "symbol":       sym,
             "name":         coin.get("name", sym),
             "coin_id":      cid,
@@ -391,7 +490,12 @@ def detect_whale_rides(
             "atr_pct":      round(atr_pct, 2),
             "rsi_14":       round(rsi_14, 1),
             "ema_20_h":     ema_20_h,
-        })
+            "obi":          _obi,
+            "funding_rate": _funding_rate,
+            "bb_squeeze":   _bb_squeeze,
+        }
+        _entry["p25_prob"] = round(_estimate_p25_probability(_entry), 3)
+        candidates.append(_entry)
 
     # Update last-seen 24h
     for coin in coins:
@@ -408,7 +512,7 @@ def detect_whale_rides(
         return c["vol_ratio"] * c["vol_mcap"]
 
     candidates.sort(key=lambda x: (
-        {"PRE": 0, "EARLY": 1, "MID": 2}.get(x["stage"], 3),
+        {"ACCUMULATION": 0, "PRE": 1, "EARLY": 2, "MID": 3}.get(x["stage"], 4),
         -_whale_score(x),
     ))
     return candidates
@@ -437,10 +541,7 @@ def send_whale_ride_alerts(
 
     # ── High-Conviction Filter Logic (Noise-Beater Edition) ───────────────────
     high_conviction = []
-    
-    # 0. Global Market Check (BTC Sideways)
-    if not _is_btc_sideways():
-        return [] # Skip all signals if BTC is volatile
+    _btc_sideways = _is_btc_sideways()  # used for God-Tier batch message, not P25 gate
 
     # Fetch news for all candidates to check for "Recent News" disqualifier
     from src.connectors.web_research import fetch_news_for_coins
@@ -481,11 +582,20 @@ def send_whale_ride_alerts(
         if vol_mult < vol_threshold: continue
         
         if vol_mcap > 0.60: continue
-        if not (2.0 <= ch24 <= 30.0): continue # Expanded lower bound per NB rules
+        if stage == "ACCUMULATION":
+            if not (0.5 <= ch24 <= 2.0): continue
+        elif stage == "PRE":
+            if not (2.0 <= ch24 <= 7.0): continue
+        else:
+            if not (2.0 <= ch24 <= 30.0): continue
         if ath_dist > -15.0: continue
-        
-        # Stage filter
-        if stage not in ("EARLY", "MID"): continue
+
+        # Stage filter — PRE/ACCUMULATION require OBI confirmation (strong buy pressure)
+        if stage == "ACCUMULATION":
+            if c.get("obi", 0) < _OBI_BULLISH:
+                continue
+        elif stage not in ("EARLY", "MID", "PRE"):
+            continue
 
         # 2. BONUS SCORE
         score = 0
@@ -494,15 +604,18 @@ def send_whale_ride_alerts(
         if vol_mult > 5.0:     score += 1
         if ath_dist < -80.0:   score += 1
         if 0.10 <= vol_mcap <= 0.35: score += 1
-        
+        # Early accumulation signals
+        if c.get("obi", 0) >= _OBI_BULLISH:     score += 2  # strong buy side pressure
+        if c.get("bb_squeeze"):                  score += 1  # band squeeze = breakout imminent
+        if c.get("funding_rate", 0.0) < -0.02:  score += 1  # short squeeze potential
+
         # Persistence check (2+ times in 48h)
         sym_data = active.get(sym, {})
         hits = sym_data.get("hits", [])
         if len([h for h in hits if now_ts - h <= 48 * 3600]) >= 2:
             score += 1
-        
-        # 3. God-Tier Filter (100% Confidence Mode)
-        # Require Score >= 6 OR Cycle >= 3 (Lowered score bar due to tighter technical filters)
+
+        # 3. God-Tier Filter — Require Score >= 6 OR Cycle >= 3
         _cyc = len([h for h in hits if now_ts - h <= 48 * 3600]) + 1
         if score >= 6 or _cyc >= 3:
             c["hc_score"] = score
@@ -515,7 +628,7 @@ def send_whale_ride_alerts(
     for rank, c in enumerate(high_conviction, 1):
         hc_lines.append(
             f"  {c['symbol']:6} | {_fmt_mcap(c['mcap']):>5} | {c['vol_ratio']:>4.1f}x | {c['vol_mcap']:>4.2f}x | "
-            f"{c['change_24h']:>+5.1f}% | {c['change_7d']:>+5.1f}% | {c['ath_change']:>4.0f}% | {c['hc_score']}/8"
+            f"{c['change_24h']:>+5.1f}% | {c['change_7d']:>+5.1f}% | {c['ath_change']:>4.0f}% | {c['hc_score']}/11"
         )
     
     if high_conviction:
@@ -546,18 +659,21 @@ def send_whale_ride_alerts(
             mcap        = c.get("mcap", 0)
             ath_chg     = c.get("ath_change", 0)
             cold        = " ❄️" if c.get("cold_start") else ""
-            stage_icon  = {"PRE": "🔵", "EARLY": "🟢", "MID": "🟡"}.get(stage, "⚪")
+            stage_icon  = {"ACCUMULATION": "⚡", "PRE": "🔵", "EARLY": "🟢", "MID": "🟡"}.get(stage, "⚪")
             mcap_str    = _fmt_mcap(mcap) if mcap else "?"
             vol_str     = _fmt_mcap(vol_usd) if vol_usd else "?"
             avg_str     = _fmt_mcap(avg_vol_usd) if avg_vol_usd else "?"
             ath_str     = f"{ath_chg:+.0f}% from ATH" if ath_chg else ""
             _coin_id = c.get("coin_id", "")
             _link    = f' <a href="https://www.coingecko.com/en/coins/{_coin_id}">CG</a>' if _coin_id else ""
+            _obi_str = f" | OBI {c.get('obi', 0)*100:.0f}%" if c.get("obi", 0) > 0 else ""
+            _bb_str  = " | BB✓" if c.get("bb_squeeze") else ""
+            _fr_str  = f" | FR {c.get('funding_rate', 0):+.3f}%" if c.get("funding_rate", 0) < -0.02 else ""
             lines.append(
                 f"  #{rank} <b>{sym}</b> ({name}) {stage_icon} {stage}{cold}{_link}\n"
                 f"     {_fmt_price(price_usd)}  24h {ch24:+.1f}%  7d {ch7d:+.0f}%\n"
                 f"     vol {vol_str} ({vol_ratio:.1f}x avg {avg_str})  vol/mcap {vol_mcap:.2f}x\n"
-                f"     mcap {mcap_str} | {ath_str} | Score {c['hc_score']}/8 | Cycle #{c['cycle_number']}"
+                f"     mcap {mcap_str} | {ath_str} | Score {c['hc_score']}/11 | Cycle #{c['cycle_number']}{_obi_str}{_bb_str}{_fr_str}"
             )
     
     # ── Send Message ──
@@ -635,26 +751,42 @@ def send_whale_ride_alerts(
         })
         
         if is_new:
-            # Auto-open position: only GOD-TIER ones (score >= 7 or cycle >= 3)
-            _hc_score = c.get("hc_score", 0)
-            _cyc      = c.get("cycle_number", 1)
+            # Auto-open: require P(+25%) >= 72% (raised from 65%) — PROVE hit -11.6% at 65%.
+            # Also cap at 2 concurrent open whale ride positions.
+            _p25 = c.get("p25_prob", _estimate_p25_probability(c))
+            c["p25_prob"] = _p25
+            _open_whale_count = 0
+            try:
+                _open_whale_count = sum(
+                    1 for r in _log_read()
+                    if r.get("status") == "OPEN" and r.get("type") == "WHALE_RIDE"
+                )
+            except Exception:
+                pass
             _should_open = (
-                (_hc_score >= 7 or _cyc >= 3)
+                _p25 >= 0.72
                 and _auto_opened < _MAX_WHALE_AUTO
                 and _open_count < _MAX_TOTAL_POSITIONS
+                and _open_whale_count < 2
             )
             if _should_open:
+                print(f"  🟢 AUTO-OPEN {sym}: P(+25%) = {_p25:.0%} ≥ 72% threshold (whale rides: {_open_whale_count}/2)")
                 sent.append(c)
                 _whale_entry_alerts_sent.add(sym)
                 try:
                     from src.utils.logger import log_whale_ride
-                    # Map 'price' to 'entry' for log_whale_ride compatibility
                     c["entry"] = c.get("price", 0)
                     log_whale_ride(c, fg_value)
                     _auto_opened += 1
                     _open_count   += 1
                 except Exception as _e:
                     print(f"  ⚠️  Whale auto-open failed for {sym}: {_e}")
+            else:
+                _skip_reason = (
+                    f"concurrent limit ({_open_whale_count}/2 open)" if _open_whale_count >= 2
+                    else f"P(+25%) = {_p25:.0%} < 72% threshold"
+                )
+                print(f"  ⏸️  SKIP {sym}: {_skip_reason}")
 
     data["active"]     = active
     data["pre_alerts"] = pre_alerts
@@ -705,11 +837,14 @@ def check_exit_signals(
 
         exit_reason: str | None = None
         age_h = (now_ts - alert_ts) / 3600
+        pnl_pct_pre = (current - alert_price) / alert_price * 100 if alert_price > 0 and current > 0 else 0.0
 
-        if age_h > _MAX_HOLD_HOURS:
+        if pnl_pct_pre >= _EXIT_TP_PCT:
+            exit_reason = f"Take profit hit ({pnl_pct_pre:+.1f}% &gt;= +{_EXIT_TP_PCT:.0f}%)"
+        elif age_h > _MAX_HOLD_HOURS:
             exit_reason = f"Max hold reached ({age_h:.0f}h &gt; {_MAX_HOLD_HOURS:.0f}h)"
-        elif ch24 < _EXIT_24H_FLOOR:
-            exit_reason = f"24h momentum slowing ({ch24:+.1f}% &lt; +{_EXIT_24H_FLOOR:.0f}%)"
+        elif pnl_pct_pre < -_EXIT_ENTRY_STOP and age_h >= 2:
+            exit_reason = f"Stopped from entry ({pnl_pct_pre:+.1f}% &lt; -{_EXIT_ENTRY_STOP:.0f}%)"
         elif rsi is not None and rsi > _EXIT_RSI_CEIL:
             exit_reason = f"RSI {rsi:.1f} &gt; {_EXIT_RSI_CEIL:.0f} (overbought)"
 
@@ -719,9 +854,9 @@ def check_exit_signals(
         pnl_pct = (current - alert_price) / alert_price * 100 if alert_price > 0 and current > 0 else 0.0
         pnl_str = f" ({pnl_pct:+.1f}% from alert price)" if alert_price > 0 and current > 0 else ""
 
-        # Failure diagnosis when position never reached +15%
+        # Failure diagnosis when position never reached TP
         failure_note = ""
-        if pnl_pct < 15.0:
+        if pnl_pct < _EXIT_TP_PCT:
             _ch24_entry = alert.get("ch24_at_alert", 0)
             _fail_notes = []
             if stage == "PRE":
@@ -738,7 +873,7 @@ def check_exit_signals(
             else:
                 _cause = "pump stalled"
             failure_note = (
-                f"\n\n  ❌ <b>Never reached +15%</b> — {_cause}"
+                f"\n\n  ❌ <b>Never reached +{_EXIT_TP_PCT:.0f}%</b> — {_cause}"
                 + (f"\n  ℹ️  Signal at entry: {' | '.join(_fail_notes)}" if _fail_notes else "")
             )
 

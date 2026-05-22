@@ -302,7 +302,7 @@ def _fetch_coins_whale(pages: int = 4) -> list[dict]:
 
 def run_whale_check() -> None:
     """
-    Lightweight whale ride detector — runs every 15 min.
+    Lightweight whale ride detector — runs every 4 hours.
     Coin list cached 1 hour (4 pages × 250 = 1,000 coins) — fetched once
     per hour, reused across the 3 checks within that hour.
     No Groq, no full TA — fastest possible whale catch.
@@ -383,7 +383,8 @@ def run_whale_check() -> None:
         candidates = detect_whale_rides(coins, risk_map, vol_history=vol_hist)
         if candidates:
             syms_str = ", ".join(
-                f"{c['symbol']} ({c['stage']} {c['change_24h']:+.1f}%)" for c in candidates
+                f"{c['symbol']} ({c['stage']} {c['change_24h']:+.1f}% P25={c.get('p25_prob', 0):.0%})"
+                for c in candidates
             )
             print(f"  🐋 {len(candidates)} whale ride candidate(s): {syms_str}")
             send_whale_ride_alerts(candidates, fg)
@@ -556,15 +557,52 @@ def run_scan_cycle(
     try:
         from src.connectors.coingecko import fetch_prices
         btc_data = fetch_prices(["bitcoin"])
-        if btc_data and btc_data[0].change_24h < -1.0:
+        if btc_data and btc_data[0].change_24h < -3.0:
             _btc_gate_active = True
             print(f"\n  🛑 BTC SAFETY GATE ACTIVE (BTC {btc_data[0].change_24h:+.1f}% 24h)")
             print("     Blocking all new LONG/SPOT entries until market stabilizes.")
     except Exception: pass
 
+    # Hard fear gate: F&G < 25 → no new scanner entries (extreme fear only)
+    # F&G 25-29: soft gate in scanner.py blocks non-MACD-bull coins + ignition gate applies
+    _fg_value = fg.get("value", 50)
+    if _fg_value < 25:
+        print(f"\n  🛑 HARD FEAR GATE (F&G={_fg_value} < 25) — no new scanner entries in extreme fear")
+        recs = []
+
     # God-Tier: HIGH confidence (>= 0.8) OR Medium (>= 0.6) with elite technical score.
+    # MEDIUM requires score >= 20 (raised from 16 — GIGGLE/ARC both slipped through at 18/20 MEDIUM)
     _CONF_MAP  = {"high": 0.9, "medium": 0.6, "low": 0.3}
     _score_map = {c["symbol"].upper(): c.get("score", 0) for c in analysis_coins}
+
+    # Gate: max 1 new scanner entry per 20h — quality over quantity.
+    # Check if we already opened a SCANNER position in the last 20h.
+    _daily_entry_blocked = False
+    try:
+        import csv as _csv_daily
+        from datetime import datetime as _dt_daily, timezone as _tz_daily, timedelta as _td_daily
+        _rec_path_daily = config.DATA_DIR / "recommendations.csv"
+        if _rec_path_daily.exists():
+            with open(_rec_path_daily, newline="", encoding="utf-8") as _rf_daily:
+                _recent_rows = [
+                    r for r in _csv_daily.DictReader(_rf_daily)
+                    if r.get("type", "SCANNER") in ("SCANNER", "") and r.get("status") == "OPEN"
+                ]
+            _cutoff = _dt_daily.now(_tz_daily.utc) - _td_daily(hours=20)
+            for _rr in _recent_rows:
+                try:
+                    _rr_dt = _dt_daily.fromisoformat((_rr.get("date") or "").replace(" UTC", "+00:00"))
+                    if _rr_dt.tzinfo is None:
+                        _rr_dt = _rr_dt.replace(tzinfo=_tz_daily.utc)
+                    if _rr_dt >= _cutoff:
+                        _daily_entry_blocked = True
+                        print(f"\n  🛑 DAILY ENTRY GATE: already opened scanner position in last 20h ({_rr.get('coin','?')} @ {_rr.get('date','')})")
+                        break
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     best_picks = []
     print("\n  🔍 God-Tier Filter Check:")
     for r in recs:
@@ -578,13 +616,32 @@ def run_scan_cycle(
         side  = r.get("recommended_order", "SPOT")
 
         is_high_conf  = conf >= 0.8
-        is_elite_tech = (side == "SPOT" and score >= 10)
+        is_elite_tech = (side in ("SPOT", "LONG") and score >= 20)  # 20 for MEDIUM (was 16)
 
-        if is_high_conf or (conf >= 0.6 and is_elite_tech):
+        if is_high_conf and score >= 16:
+            best_picks.append(r)
+        elif conf >= 0.6 and is_elite_tech:
             best_picks.append(r)
         else:
-            reason = "AI confidence too low" if conf < 0.6 else "Needs elite score for medium confidence"
+            reason = "Score < 20" if score < 20 else ("AI confidence too low" if conf < 0.6 else "Needs score ≥20 for medium confidence")
             print(f"     ❌ {sym} rejected: {reason} (Conf: {r.get('confidence','?')}, Score: {score})")
+
+    # Take only the single best pick: HIGH confidence first, then highest score.
+    best_picks.sort(
+        key=lambda r: (
+            _CONF_MAP.get((r.get("confidence") or "low").lower(), 0.3),
+            _score_map.get(r["coin"].upper(), 0),
+        ),
+        reverse=True,
+    )
+    if len(best_picks) > 1:
+        dropped = [r["coin"].upper() for r in best_picks[1:]]
+        print(f"  ℹ️  1-pick-per-scan limit — dropping lower-ranked: {', '.join(dropped)}")
+    best_picks = best_picks[:1]
+
+    if best_picks and _daily_entry_blocked:
+        print(f"  🛑 DAILY GATE: skipping {best_picks[0]['coin'].upper()} — already entered a position today.")
+        best_picks = []
 
     if best_picks:
         print_header("GOD-TIER HIGH-CONVICTION OPPORTUNITIES")
@@ -594,12 +651,12 @@ def run_scan_cycle(
             _conf  = p.get("confidence", "low").upper()
             _score = _score_map.get(_sym, 0)
 
-            # Final gate: SPOT score >= 8
-            if not (_side == "SPOT" and _score >= 8):
-                print(f"     ❌ {_sym} rejected: Technical score ({_score}) not elite enough for God-Tier mode.")
+            # Final gate: SPOT or LONG, score >= 16
+            if not (_side in ("SPOT", "LONG") and _score >= 16):
+                print(f"     ❌ {_sym} rejected: Technical score ({_score}) below 16 threshold.")
                 continue
 
-            if _btc_gate_active and _side == "SPOT":
+            if _btc_gate_active and _side in ("SPOT", "LONG"):
                 print(f"     🛑 {_sym} rejected: BTC Safety Gate is BLOCKING longs.")
                 continue
 
@@ -804,9 +861,9 @@ def main():
         # Start price alert monitor — checks every 15min for milestone/proximity alerts
         import threading
         from src.utils.price_alerts import run_alert_loop
-        alert_thread = threading.Thread(target=run_alert_loop, args=(15,), daemon=True, name="price-alerts")
+        alert_thread = threading.Thread(target=run_alert_loop, args=(1,), daemon=True, name="price-alerts")
         alert_thread.start()
-        print("  Price alert monitor started (every 15 min)")
+        print("  Price alert monitor started (every 1 min)")
 
         # Run immediately, then every 3h (full scan) + every 24h (whale check)
         run_scan_cycle(exchange=args.exchange, debate=args.debate)
@@ -822,10 +879,17 @@ def main():
         scheduler.add_job(
             run_whale_check,
             trigger="interval",
-            minutes=15,
+            hours=4,
             id="whale_check",
         )
-        print(f"\n  Scheduler running — full scan every 1h, whale check every 15m. Ctrl+C to stop.\n")
+        from src.utils.logger import update_open_positions as _uop_sched
+        scheduler.add_job(
+            _uop_sched,
+            trigger="interval",
+            minutes=1,
+            id="position_tracker",
+        )
+        print(f"\n  Scheduler running — full scan every 1h, whale check every 4h, position tracker every 1m. Ctrl+C to stop.\n")
         try:
             scheduler.start()
         except KeyboardInterrupt:
@@ -843,9 +907,9 @@ def main():
 
         import threading
         from src.utils.price_alerts import run_alert_loop
-        alert_thread = threading.Thread(target=run_alert_loop, args=(15,), daemon=True, name="price-alerts")
+        alert_thread = threading.Thread(target=run_alert_loop, args=(1,), daemon=True, name="price-alerts")
         alert_thread.start()
-        print("  Price alert monitor started (every 15 min)")
+        print("  Price alert monitor started (every 1 min)")
 
         # Run immediately, then every 3h (full scan) + every 24h (whale check)
         run_scan_cycle(exchange=args.exchange, debate=args.debate,
@@ -863,10 +927,17 @@ def main():
         scheduler.add_job(
             run_whale_check,
             trigger="interval",
-            minutes=15,
+            hours=4,
             id="whale_check",
         )
-        print(f"\n  Crypto scheduler running — full scan every 1h, whale check every 15m. Ctrl+C to stop.\n")
+        from src.utils.logger import update_open_positions as _uop_cs
+        scheduler.add_job(
+            _uop_cs,
+            trigger="interval",
+            minutes=1,
+            id="position_tracker",
+        )
+        print(f"\n  Crypto scheduler running — full scan every 1h, whale check every 4h, position tracker every 1m. Ctrl+C to stop.\n")
         try:
             scheduler.start()
         except KeyboardInterrupt:
