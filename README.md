@@ -15,8 +15,8 @@ AI-powered crypto scanner and trading advisor. Scans top 1000 coins, runs techni
 ## Quick Start
 
 ```bash
-git clone https://github.com/izhechev/crypto-trading-polimarket-llm.git
-cd crypto-trading-polimarket-llm
+git clone https://github.com/izhechev/crypto-advisor-llm.git
+cd crypto-advisor-llm
 python -m venv .venv && .venv\Scripts\activate  # Windows
 pip install -r requirements.txt
 cp .env.example .env   # fill in API keys
